@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import type {
+    CallToolResult,
+    ElicitRequestFormParams,
+    ElicitResult
+} from '@modelcontextprotocol/sdk/types.js';
 
 import { Guard } from '../src/guard.js';
 import type { Mutation } from '../src/guard.js';
@@ -355,6 +362,265 @@ describe('tools', () => {
 
             expect(server.server).toBeDefined();
             expect(server.isConnected()).toBe(false);
+        });
+    });
+
+    /**
+     * These tests drive the real protocol, because the rule under test IS the
+     * protocol: a capability the client declares at initialize time, and a
+     * request the server sends back down the same connection mid-tool-call.
+     * A hand-rolled fake could not get either half wrong in the ways that
+     * matter, so the SDK's own in-memory transport pair carries a real Client
+     * talking to the real server built by buildServer.
+     */
+    describe('destructive-tier confirmation', () => {
+        /** The fake user: what they answer when the server asks. */
+        type Responder = (params: ElicitRequestFormParams) => ElicitResult;
+
+        const ACCEPTS: Responder = () => ({ action: 'accept', content: { confirm: true } });
+
+        /**
+         * A connected client/server pair.
+         *
+         * `elicitation: false` builds a client that declares no elicitation
+         * capability at all — not one that declines, one that cannot be asked.
+         * The SDK refuses to register an elicitation handler on such a client,
+         * which is exactly the shape of the client this rule guards against.
+         */
+        async function connect(options: { elicitation: boolean; respond?: Responder }) {
+            const harness = makeDeps();
+            const server = buildServer(harness.deps);
+            const requests: ElicitRequestFormParams[] = [];
+            let responder: Responder = options.respond ?? ACCEPTS;
+
+            const client = new Client(
+                { name: 'confirmation-test-client', version: '0.0.0' },
+                { capabilities: options.elicitation ? { elicitation: {} } : {} }
+            );
+
+            if (options.elicitation) {
+                client.setRequestHandler(ElicitRequestSchema, (request) => {
+                    const params = request.params as ElicitRequestFormParams;
+                    requests.push(params);
+                    return responder(params);
+                });
+            }
+
+            const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+            await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+            async function call(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
+                return (await client.callTool({ name, arguments: args })) as CallToolResult;
+            }
+
+            /** propose_write over the wire, returning the tokenId. */
+            async function propose(mutation: Mutation): Promise<string> {
+                return proposalOf(await call('propose_write', { mutation })).tokenId;
+            }
+
+            return {
+                ...harness,
+                requests,
+                call,
+                propose,
+                answerWith(next: Responder) {
+                    responder = next;
+                },
+                async close() {
+                    await client.close();
+                    await server.close();
+                }
+            };
+        }
+
+        it('asks before a destructive write, and applies it once the user confirms', async () => {
+            const wire = await connect({ elicitation: true });
+            try {
+                const mutation = EVERY_OP[3]!; // change_stage c-004 -> Closed-Won
+
+                const tokenId = await wire.propose(mutation);
+                const result = await wire.call('execute_write', { tokenId, mutation });
+
+                expect(result.isError).toBeFalsy();
+                expect(contactOf(result).stage).toBe('Closed-Won');
+                expect(wire.store.getContact('c-004').stage).toBe('Closed-Won');
+                expect(wire.requests).toHaveLength(1);
+            } finally {
+                await wire.close();
+            }
+        });
+
+        it('states the operation, the contact and the payload in the form it sends', async () => {
+            const wire = await connect({ elicitation: true });
+            try {
+                const mutation = EVERY_OP[4]!; // delete_contact c-006
+
+                const tokenId = await wire.propose(mutation);
+                expect((await wire.call('execute_write', { tokenId, mutation })).isError).toBeFalsy();
+
+                const params = wire.requests[0]!;
+                const schema = params.requestedSchema;
+                const field = schema.properties[
+                    'confirm'
+                ] as { type: string; description?: string } | undefined;
+
+                // One required boolean named confirm, and nothing else to answer.
+                expect(Object.keys(schema.properties)).toEqual(['confirm']);
+                expect(schema.required).toEqual(['confirm']);
+                expect(field?.type).toBe('boolean');
+
+                // The description says exactly what is about to happen.
+                expect(field?.description).toContain('delete_contact');
+                expect(field?.description).toContain('c-006');
+                expect(field?.description).toContain('Tobias Merrigold');
+                expect(params.message).toContain('c-006');
+            } finally {
+                await wire.close();
+            }
+        });
+
+        it('names the payload of a remove_tag confirmation', async () => {
+            const wire = await connect({ elicitation: true });
+            try {
+                const mutation = EVERY_OP[2]!; // remove_tag net-30 from c-003
+
+                const tokenId = await wire.propose(mutation);
+                expect((await wire.call('execute_write', { tokenId, mutation })).isError).toBeFalsy();
+
+                const field = wire.requests[0]!.requestedSchema.properties['confirm'] as {
+                    description?: string;
+                };
+
+                expect(field.description).toContain('remove_tag');
+                expect(field.description).toContain('c-003');
+                expect(field.description).toContain('net-30');
+                expect(wire.store.getContact('c-003').tags).not.toContain('net-30');
+            } finally {
+                await wire.close();
+            }
+        });
+
+        it('refuses when the user answers no, and leaves the token unspent', async () => {
+            const wire = await connect({
+                elicitation: true,
+                respond: () => ({ action: 'accept', content: { confirm: false } })
+            });
+            try {
+                const mutation = EVERY_OP[4]!; // delete_contact c-006
+
+                const tokenId = await wire.propose(mutation);
+                const refused = await wire.call('execute_write', { tokenId, mutation });
+
+                expect(refused.isError).toBe(true);
+                expect(textOf(refused)).toContain('ConfirmationDeclinedError');
+                expect(textOf(refused)).toContain('answered no');
+                expect(wire.store.listContacts().map((contact) => contact.id)).toContain('c-006');
+
+                // The point of eliciting BEFORE the guard: a refusal costs the
+                // caller nothing. The same warrant is still good, so the same
+                // tokenId executes the moment the user changes their mind.
+                wire.answerWith(ACCEPTS);
+                const confirmed = await wire.call('execute_write', { tokenId, mutation });
+
+                expect(payloadOf(confirmed)).toEqual({ deleted: true, contactId: 'c-006' });
+                expect(wire.store.listContacts().map((contact) => contact.id)).not.toContain('c-006');
+                expect(wire.requests).toHaveLength(2);
+            } finally {
+                await wire.close();
+            }
+        });
+
+        it('refuses when the user declines or cancels the prompt', async () => {
+            for (const action of ['decline', 'cancel'] as const) {
+                const wire = await connect({ elicitation: true, respond: () => ({ action }) });
+                try {
+                    const mutation = EVERY_OP[4]!; // delete_contact c-006
+
+                    const tokenId = await wire.propose(mutation);
+                    const refused = await wire.call('execute_write', { tokenId, mutation });
+
+                    expect(refused.isError).toBe(true);
+                    expect(textOf(refused)).toContain('ConfirmationDeclinedError');
+                    expect(textOf(refused)).toContain(action === 'decline' ? 'declined' : 'cancelled');
+                    expect(wire.store.listContacts().map((contact) => contact.id)).toContain('c-006');
+                    expect(wire.requests).toHaveLength(1);
+                } finally {
+                    await wire.close();
+                }
+            }
+        });
+
+        it('refuses every destructive write when the client declares no elicitation capability', async () => {
+            const wire = await connect({ elicitation: false });
+            try {
+                for (const mutation of EVERY_OP.filter((candidate) => candidate.op !== 'add_note' && candidate.op !== 'add_tag')) {
+                    const tokenId = await wire.propose(mutation);
+                    const refused = await wire.call('execute_write', { tokenId, mutation });
+
+                    expect(refused.isError).toBe(true);
+                    expect(textOf(refused)).toContain('ConfirmationUnavailableError');
+                    expect(textOf(refused)).toContain('interactive confirmation channel');
+                    expect(textOf(refused)).toContain('does not advertise one');
+                    expect(textOf(refused)).toContain(mutation.op);
+                }
+
+                // Nothing degraded quietly into a write.
+                expect(wire.store.getContact('c-003').tags).toContain('net-30');
+                expect(wire.store.getContact('c-004').stage).not.toBe('Closed-Won');
+                expect(wire.store.listContacts().map((contact) => contact.id)).toContain('c-006');
+            } finally {
+                await wire.close();
+            }
+        });
+
+        it('leaves the reversible tier alone: no capability needed, nothing asked', async () => {
+            const withoutChannel = await connect({ elicitation: false });
+            try {
+                const mutation = EVERY_OP[0]!; // add_note c-001
+
+                const tokenId = await withoutChannel.propose(mutation);
+                const result = await withoutChannel.call('execute_write', { tokenId, mutation });
+
+                expect(result.isError).toBeFalsy();
+                expect(contactOf(result).notes).toHaveLength(2);
+                expect(withoutChannel.store.getContact('c-001').notes).toHaveLength(2);
+            } finally {
+                await withoutChannel.close();
+            }
+
+            // And a client that COULD be asked still is not, for a reversible op.
+            const withChannel = await connect({ elicitation: true });
+            try {
+                const mutation = EVERY_OP[1]!; // add_tag vip on c-001
+
+                const tokenId = await withChannel.propose(mutation);
+                const result = await withChannel.call('execute_write', { tokenId, mutation });
+
+                expect(result.isError).toBeFalsy();
+                expect(withChannel.store.getContact('c-001').tags).toContain('vip');
+                expect(withChannel.requests).toHaveLength(0);
+            } finally {
+                await withChannel.close();
+            }
+        });
+
+        it('still enforces the store floor after the user confirms', async () => {
+            const wire = await connect({ elicitation: true });
+            try {
+                const mutation: Mutation = { op: 'delete_contact', contactId: 'c-007' };
+
+                const tokenId = await wire.propose(mutation);
+                const refused = await wire.call('execute_write', { tokenId, mutation });
+
+                // Confirmation is a gate, not an override: the frozen record
+                // stays frozen no matter who says yes.
+                expect(refused.isError).toBe(true);
+                expect(textOf(refused)).toContain('NeverWriteStateError');
+                expect(wire.requests).toHaveLength(1);
+                expect(wire.store.listContacts().map((contact) => contact.id)).toContain('c-007');
+            } finally {
+                await wire.close();
+            }
         });
     });
 });

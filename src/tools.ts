@@ -20,13 +20,27 @@
  *    `execute_write` presents that warrant back. The store is only ever touched
  *    on the far side of a verified warrant.
  *
+ * On top of the two-step shape sits one more gate, and it is the only rule this
+ * module owns outright: **a destructive write is confirmed by a human before it
+ * is executed.** The guard cannot ask a person anything — it has no I/O — and
+ * the store cannot either, so the asking belongs here, where the protocol is.
+ * The channel is MCP's form elicitation, which exists only if the connected
+ * client says it does; a client that never advertised it is not talked into
+ * one. See {@link handleConfirmedExecuteWrite} for why the asking happens
+ * *before* the guard is consulted rather than after.
+ *
  * Tool descriptions here are written for the model that will call them. They
  * are security documentation at the point of use — the rules are stated where
  * the decision is made, not in a README nobody in the loop can read.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import type {
+    CallToolResult,
+    ClientCapabilities,
+    ElicitRequestFormParams,
+    ElicitResult
+} from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
 import { Guard, GuardError, WRITE_TIERS } from './guard.js';
@@ -239,11 +253,232 @@ export function handleExecuteWrite(
 }
 
 /**
+ * The confirmation channel, narrowed to the two things this module asks of it.
+ *
+ * The SDK's `Server` satisfies this structurally — `buildServer` passes its own
+ * `server.server` — but naming the seam keeps the rest of the file honest about
+ * what it uses: it may ask what the client declared, and it may ask the user one
+ * question. It cannot send notifications, sample, or otherwise take the wire for
+ * a walk.
+ */
+export interface ConfirmationChannel {
+    /** What the client declared at initialize time, or `undefined` before it. */
+    getClientCapabilities(): ClientCapabilities | undefined;
+    /** Ask the user a form question and wait for their answer. */
+    elicitInput(params: ElicitRequestFormParams): Promise<ElicitResult>;
+}
+
+/** The field the confirmation form asks for, and the only one it accepts. */
+const CONFIRM_FIELD = 'confirm';
+
+/**
+ * A refusal this module owns, rather than one it is relaying.
+ *
+ * Same shape as {@link refuse}, same discipline: name the rule in the text,
+ * because the caller is a model deciding what to do next.
+ */
+function refusal(rule: string, message: string): CallToolResult {
+    return { isError: true, content: [{ type: 'text', text: `${rule}: ${message}` }] };
+}
+
+/**
+ * Whether this op must be confirmed by a human before it executes.
+ *
+ * Written as "not reversible" rather than "is destructive" deliberately. Both
+ * readings pick out exactly `remove_tag`, `change_stage` and `delete_contact`
+ * today, because every op in {@link WRITE_TIERS} is one or the other — but an op
+ * this function has never heard of falls on the confirm side, not the silent
+ * side. Fail-closed applies to the tier table too.
+ */
+function requiresConfirmation(op: Mutation['op']): boolean {
+    return WRITE_TIERS[op] !== 'reversible';
+}
+
+/**
+ * Whether the connected client advertised a form-elicitation channel.
+ *
+ * The SDK normalizes a bare `elicitation: {}` capability into `{ form: {} }`
+ * when it parses the initialize request, so an older client that declares
+ * elicitation without naming a mode still reads as form-capable here. A client
+ * that declared only `url` mode does not: it has a channel, but not one this
+ * server knows how to ask a yes/no question over, and pretending otherwise
+ * would mean an unconfirmed destructive write.
+ */
+function supportsFormElicitation(capabilities: ClientCapabilities | undefined): boolean {
+    return capabilities?.elicitation?.form !== undefined;
+}
+
+/** ` (Idris Vantol)`, or nothing at all if the id resolves to no contact. */
+function nameSuffix(deps: ToolDeps, contactId: string): string {
+    try {
+        return ` (${deps.store.getContact(contactId).name})`;
+    } catch {
+        // A confirmation prompt is not the place to raise a lookup failure. The
+        // store will refuse the write on its own terms a moment from now.
+        return '';
+    }
+}
+
+/**
+ * The exact sentence the user is asked to agree to.
+ *
+ * It names the operation, the contact, and the payload, because a confirmation
+ * dialog that says "allow this write?" is not a confirmation of anything. The
+ * op name is spelled out verbatim so the sentence the human reads and the tool
+ * call the model made can be matched against each other by eye.
+ */
+function confirmationSentence(deps: ToolDeps, mutation: Mutation): string {
+    const target = `contact ${mutation.contactId}${nameSuffix(deps, mutation.contactId)}`;
+
+    switch (mutation.op) {
+        case 'add_note':
+            return `add_note: append the note ${JSON.stringify(mutation.text)} to ${target}?`;
+        case 'add_tag':
+            return `add_tag: add the tag ${JSON.stringify(mutation.tag)} to ${target}?`;
+        case 'remove_tag':
+            return (
+                `remove_tag: remove the tag ${JSON.stringify(mutation.tag)} from ${target}? ` +
+                `DESTRUCTIVE: the tag is not recoverable from the record afterwards.`
+            );
+        case 'change_stage':
+            return (
+                `change_stage: move ${target} to stage ${JSON.stringify(mutation.newStage)}? ` +
+                `DESTRUCTIVE: the previous stage is not recoverable from the record afterwards.`
+            );
+        case 'delete_contact':
+            return `delete_contact: delete ${target}? This cannot be undone.`;
+    }
+}
+
+/**
+ * The elicitation request for one destructive mutation: one required boolean.
+ *
+ * The form is deliberately the smallest thing that can carry a decision. There
+ * is no free-text field to smuggle instructions through and no second question
+ * whose answer could be read as consent to the first — the user says yes to
+ * this exact sentence, or they do not.
+ */
+function confirmationRequest(deps: ToolDeps, mutation: Mutation): ElicitRequestFormParams {
+    const sentence = confirmationSentence(deps, mutation);
+
+    return {
+        mode: 'form',
+        message: `Confirm a destructive CRM write — ${sentence}`,
+        requestedSchema: {
+            type: 'object',
+            properties: {
+                [CONFIRM_FIELD]: {
+                    type: 'boolean',
+                    title: 'Confirm this write',
+                    description: sentence
+                }
+            },
+            required: [CONFIRM_FIELD]
+        }
+    };
+}
+
+/**
+ * `execute_write` as the wire sees it: confirm first, then verify, then write.
+ *
+ * **Order is the whole design here.** The elicitation runs against the mutation
+ * from the tool arguments, *before* {@link Guard.executeWrite} is ever called,
+ * and only a confirmed mutation is handed on. That is not a stylistic choice:
+ * the guard's token is single-use, and it is spent the moment it is presented.
+ * Asking afterwards would mean a user who says "no" has still burned their
+ * warrant — the refusal would cost them the write they were entitled to make,
+ * and every declined prompt would force a fresh `propose_write`. Asking first
+ * means declining is free: the token is untouched, still bound to the same
+ * mutation, still good until it expires.
+ *
+ * The three ways a confirmation can fail to be a yes are kept distinct in the
+ * refusal text — answered no, declined the prompt, cancelled it — because they
+ * mean different things to whoever reads the transcript later. None of them
+ * fall through to the write.
+ *
+ * Reversible writes (`add_note`, `add_tag`) skip all of this and go straight to
+ * the warrant check. Nothing is asked, because nothing is at stake that cannot
+ * be undone by hand.
+ */
+export async function handleConfirmedExecuteWrite(
+    deps: ToolDeps,
+    channel: ConfirmationChannel,
+    args: { tokenId: string; mutation: Mutation }
+): Promise<CallToolResult> {
+    if (!requiresConfirmation(args.mutation.op)) {
+        return handleExecuteWrite(deps, args);
+    }
+
+    const attempted = `Refused ${args.mutation.op} on contact ${args.mutation.contactId}`;
+
+    if (!supportsFormElicitation(channel.getClientCapabilities())) {
+        // Fail closed. The alternative — executing because nobody could be
+        // asked — is exactly the degradation this gate exists to prevent.
+        return refusal(
+            'ConfirmationUnavailableError',
+            `${attempted}: this server requires an interactive confirmation channel for destructive ` +
+                `operations, and the connected client does not advertise one (no form elicitation ` +
+                `capability was declared at initialize time). ` +
+                `Rule: destructive-tier writes (remove_tag, change_stage, delete_contact) are confirmed ` +
+                `by the user before anything is written, and a client that cannot ask cannot execute ` +
+                `them — the server refuses rather than writing unconfirmed. The reversible tier ` +
+                `(add_note, add_tag) remains fully available. Token "${args.tokenId}" was not spent.`
+        );
+    }
+
+    let outcome: ElicitResult;
+    try {
+        outcome = await channel.elicitInput(confirmationRequest(deps, args.mutation));
+    } catch (error: unknown) {
+        // A confirmation that could not be asked is not a confirmation.
+        const detail = error instanceof Error ? error.message : String(error);
+        return refusal(
+            'ConfirmationChannelError',
+            `${attempted}: the confirmation request to the client failed: ${detail}. ` +
+                `Rule: destructive-tier writes execute only on a confirmation that was actually ` +
+                `received — a broken channel fails closed. Token "${args.tokenId}" was not spent.`
+        );
+    }
+
+    const unspent =
+        `The mutation was not applied, and token "${args.tokenId}" was NOT spent: the confirmation ` +
+        `runs before the guard is consulted, so the warrant is still bound to this mutation and ` +
+        `still usable until it expires. Re-run execute_write with the same tokenId if the user ` +
+        `changes their mind.`;
+
+    if (outcome.action !== 'accept') {
+        return refusal(
+            'ConfirmationDeclinedError',
+            `${attempted}: the user ${outcome.action === 'decline' ? 'declined' : 'cancelled'} the ` +
+                `confirmation prompt. ` +
+                `Rule: destructive-tier writes proceed only on an explicit confirmation; anything ` +
+                `that is not a yes is a no, and it is not retried by asking again. ${unspent}`
+        );
+    }
+
+    if (outcome.content?.[CONFIRM_FIELD] !== true) {
+        return refusal(
+            'ConfirmationDeclinedError',
+            `${attempted}: the user was asked to confirm this write and answered no. ` +
+                `Rule: destructive-tier writes proceed only on an explicit confirmation. ${unspent}`
+        );
+    }
+
+    return handleExecuteWrite(deps, args);
+}
+
+/**
  * Build the MCP server: four tools, two of which are halves of one write.
  *
  * Every handler is a thin lambda over the exported functions above, so the
  * behaviour under test is the behaviour that ships — the tests drive the same
  * functions the SDK does, not a parallel copy of them.
+ *
+ * `execute_write` is wired to {@link handleConfirmedExecuteWrite} rather than to
+ * {@link handleExecuteWrite}: the confirmation gate is part of the tool, not an
+ * optional wrapper a caller could forget. The server hands itself in as the
+ * confirmation channel, so the capability check reads whatever the *currently
+ * connected* client declared — not a snapshot taken at build time.
  */
 export function buildServer(deps: ToolDeps): McpServer {
     const server = new McpServer({ name: 'mcp-capability-guard', version: '0.1.0' });
@@ -313,10 +548,19 @@ export function buildServer(deps: ToolDeps): McpServer {
                 'one for the write you actually want). A verified token is still not a promise of success: ' +
                 'the store refuses all writes to contacts in the Closed-Lost-DNC stage with ' +
                 'NeverWriteStateError, no matter what token you hold. Returns the updated contact, or a ' +
-                'deletion acknowledgment for delete_contact.',
+                'deletion acknowledgment for delete_contact. ' +
+                'One more rule applies to the destructive tier (remove_tag, change_stage, ' +
+                'delete_contact) and only to it: before any such write is performed, this server asks ' +
+                'the human operator to confirm it, by name, through your client. If they say no, or ' +
+                'dismiss the prompt, the write is refused with ConfirmationDeclinedError and the token ' +
+                'is NOT spent — you may present the same tokenId again if they change their mind, but ' +
+                'do not re-ask on your own initiative; a refusal is an answer. If your client did not ' +
+                'declare the elicitation capability there is nobody to ask, and every destructive write ' +
+                'is refused with ConfirmationUnavailableError no matter how valid the token is; the ' +
+                'reversible tier (add_note, add_tag) still works and needs no confirmation.',
             inputSchema: executeWriteShape
         },
-        (args) => handleExecuteWrite(deps, args)
+        (args) => handleConfirmedExecuteWrite(deps, server.server, args)
     );
 
     return server;

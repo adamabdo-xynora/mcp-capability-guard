@@ -2,12 +2,14 @@
  * The MCP tool surface — the only module in this project that imports the SDK.
  *
  * Everything below this file is protocol-free: the store knows about contacts,
- * the guard knows about tokens, and neither knows it is being spoken to over
- * MCP. This module is the wiring, and only the wiring. It re-implements no
- * rule that already lives underneath it: it does not decide what a token
- * authorizes (the guard does), and it does not decide which records are frozen
- * (the store does). What it adds is a *shape* — a tiered surface in which the
- * dangerous half of the API is unreachable in one step.
+ * the guard knows about tokens, the audit log knows about events, and none of
+ * them knows it is being spoken to over MCP. This module is the wiring, and
+ * only the wiring. It re-implements no rule that already lives underneath it:
+ * it does not decide what a token authorizes (the guard does), it does not
+ * decide which records are frozen (the store does), and it does not decide what
+ * a token id may look like in a record (the audit module does). What it adds is
+ * a *shape* — a tiered surface in which the dangerous half of the API is
+ * unreachable in one step.
  *
  * The tiering is the point:
  *
@@ -29,6 +31,21 @@
  * one. See {@link handleConfirmedExecuteWrite} for why the asking happens
  * *before* the guard is consulted rather than after.
  *
+ * Everything that happens here is written down. Every handler appends to the
+ * {@link AuditLog}: reads, proposals, each half of a confirmation, successful
+ * executions, and every refusal — named by the rule that produced it. Two
+ * consequences are worth stating where the wiring is:
+ *
+ *  - **No token id crosses into the record whole.** Events carry a
+ *    {@link fingerprint}, and refusal text — which the guard writes with the
+ *    token id in it — is passed through {@link redactTokenId} before it is
+ *    logged *or returned*. The full id appears in exactly one place in this
+ *    file, `propose_write`'s reply to the caller that has to spend it.
+ *  - **The log is not part of the model's surface by default.** `read_audit` is
+ *    registered only when {@link buildServer} is asked for it. Absent, not
+ *    present-and-refusing: a tool the model cannot see is a tool it cannot be
+ *    talked into calling. The audit trail is for the operator.
+ *
  * Tool descriptions here are written for the model that will call them. They
  * are security documentation at the point of use — the rules are stated where
  * the decision is made, not in a README nobody in the loop can read.
@@ -43,15 +60,34 @@ import type {
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 
+import { fingerprint, redactTokenId } from './audit.js';
+import type { AuditLog } from './audit.js';
 import { Guard, GuardError, WRITE_TIERS } from './guard.js';
 import type { Mutation } from './guard.js';
 import { ContactStoreError } from './store.js';
 import type { ContactStore, Stage } from './store.js';
 
-/** What the tool layer needs to do its job: a store to read, a guard to obey. */
+/**
+ * What the tool layer needs to do its job: a store to read, a guard to obey, a
+ * log to answer to.
+ */
 export interface ToolDeps {
     store: ContactStore;
     guard: Guard;
+    audit: AuditLog;
+}
+
+/** Options that change the shape of the registered tool surface. */
+export interface ServerOptions {
+    /**
+     * Register `read_audit`, exposing the audit trail to the model.
+     *
+     * Defaults to `false`, and the default is the security posture: the audit
+     * log records what the model asked for, so handing the model a tool to read
+     * it back is a decision an operator makes deliberately, for a session where
+     * that is useful — a demo, a debugging run, a self-review loop.
+     */
+    exposeAudit?: boolean;
 }
 
 /**
@@ -142,54 +178,112 @@ function ok(payload: unknown): CallToolResult {
 }
 
 /**
- * A refusal, as a tool result rather than a thrown exception.
+ * Name the rule an error is enforcing, and quote the text it refused with.
  *
  * The store and the guard already write their own refusals — every error class
- * they raise names the rule it is enforcing. This function's whole job is to
- * carry that text across the wire intact. It never summarizes a refusal into
- * "operation failed", never swallows one into a success, and never answers with
+ * they raise names the rule in its own message. This function's whole job is to
+ * take that apart into the two pieces the rest of the file needs: a rule name
+ * for the record, and text for the caller. It never summarizes a refusal into
+ * "operation failed", never swallows one into a success, and never reaches for
  * a stack trace: the caller is a model that has to decide what to do next, and
  * the name of the rule it hit is the only thing that helps it decide well.
  */
-function refuse(error: unknown): CallToolResult {
+function classify(error: unknown): { rule: string; message: string } {
     if (error instanceof GuardError || error instanceof ContactStoreError) {
-        return {
-            isError: true,
-            content: [{ type: 'text', text: `${error.name}: ${error.message}` }]
-        };
+        return { rule: error.name, message: error.message };
     }
 
     // Anything else is a bug rather than a rule. Say so plainly, and pass along
     // the message only — never the stack.
     const detail = error instanceof Error ? error.message : String(error);
     return {
-        isError: true,
-        content: [
-            {
-                type: 'text',
-                text: `UnexpectedToolError: the tool failed for a reason it does not model: ${detail}`
-            }
-        ]
+        rule: 'UnexpectedToolError',
+        message: `the tool failed for a reason it does not model: ${detail}`
     };
 }
 
-/** Run a handler body, turning any refusal into an isError tool result. */
-function attempt(body: () => CallToolResult): CallToolResult {
+/**
+ * A refusal, as a tool result rather than a thrown exception — and as an audit
+ * event, because a refusal nobody recorded is a refusal nobody can review.
+ *
+ * `tokenId` is the id the caller presented on this call, or `null` for tools
+ * that take no token. When there is one, the refusal text is passed through
+ * {@link redactTokenId} *before* it is either logged or returned. The guard
+ * writes messages like `Token "…" was already used`, and a live warrant quoted
+ * back in an error string is a warrant sitting in a transcript. The caller
+ * already holds the id it presented, so it loses nothing by reading the
+ * fingerprint instead.
+ */
+function refusal(
+    deps: ToolDeps,
+    tool: string,
+    tokenId: string | null,
+    rule: string,
+    message: string
+): CallToolResult {
+    const text = tokenId === null ? message : redactTokenId(message, tokenId);
+    deps.audit.append({ kind: 'refusal', tool, rule, message: text });
+    return { isError: true, content: [{ type: 'text', text: `${rule}: ${text}` }] };
+}
+
+/** Run a handler body, turning any refusal into a recorded isError tool result. */
+function attempt(
+    deps: ToolDeps,
+    tool: string,
+    tokenId: string | null,
+    body: () => CallToolResult
+): CallToolResult {
     try {
         return body();
     } catch (error: unknown) {
-        return refuse(error);
+        const { rule, message } = classify(error);
+        return refusal(deps, tool, tokenId, rule, message);
     }
 }
 
 /** `list_contacts` — a read, straight through to the store. */
 export function handleListContacts(deps: ToolDeps): CallToolResult {
-    return attempt(() => ok(deps.store.listContacts()));
+    return attempt(deps, 'list_contacts', null, () => {
+        const contacts = deps.store.listContacts();
+        deps.audit.append({
+            kind: 'read',
+            tool: 'list_contacts',
+            summary: `listed ${contacts.length} contacts`
+        });
+        return ok(contacts);
+    });
 }
 
 /** `get_contact` — a read, straight through to the store. */
 export function handleGetContact(deps: ToolDeps, args: { contactId: string }): CallToolResult {
-    return attempt(() => ok(deps.store.getContact(args.contactId)));
+    return attempt(deps, 'get_contact', null, () => {
+        const contact = deps.store.getContact(args.contactId);
+        deps.audit.append({
+            kind: 'read',
+            tool: 'get_contact',
+            summary: `read contact ${args.contactId}`
+        });
+        return ok(contact);
+    });
+}
+
+/**
+ * `read_audit` — a read of the log itself, registered only on request.
+ *
+ * Reading the log is itself an event, so it is appended: an operator who wants
+ * to know who looked can find out. The snapshot is taken before the append, so
+ * a reply never contains the line describing its own delivery.
+ */
+export function handleReadAudit(deps: ToolDeps): CallToolResult {
+    return attempt(deps, 'read_audit', null, () => {
+        const events = deps.audit.list();
+        deps.audit.append({
+            kind: 'read',
+            tool: 'read_audit',
+            summary: `read ${events.length} audit events`
+        });
+        return ok({ count: events.length, events });
+    });
 }
 
 /**
@@ -204,16 +298,43 @@ export function handleGetContact(deps: ToolDeps, args: { contactId: string }): C
  * `tier` is the one piece of guard-side judgment that does cross: it tells the
  * caller, before it commits, whether the write it just proposed is reversible
  * or destructive.
+ *
+ * This reply is also the single place in the program where a whole token id is
+ * written down, and it has to be: the caller cannot spend a warrant it cannot
+ * quote. The audit event for the same proposal carries only the fingerprint.
  */
 export function handleProposeWrite(deps: ToolDeps, args: { mutation: Mutation }): CallToolResult {
-    return attempt(() => {
+    return attempt(deps, 'propose_write', null, () => {
         const token = deps.guard.proposeWrite(args.mutation);
-        return ok({
-            tokenId: token.id,
-            expiresAt: token.expiresAt,
-            tier: WRITE_TIERS[args.mutation.op]
+        const tier = WRITE_TIERS[args.mutation.op];
+
+        deps.audit.append({
+            kind: 'propose',
+            op: args.mutation.op,
+            contactId: args.mutation.contactId,
+            tier,
+            tokenFingerprint: fingerprint(token.id)
         });
+
+        return ok({ tokenId: token.id, expiresAt: token.expiresAt, tier });
     });
+}
+
+/** Apply a mutation the guard has already verified. Never called before that. */
+function applyVerified(deps: ToolDeps, verified: Mutation): CallToolResult {
+    switch (verified.op) {
+        case 'add_note':
+            return ok(deps.store.addNote(verified.contactId, verified.text));
+        case 'add_tag':
+            return ok(deps.store.addTag(verified.contactId, verified.tag));
+        case 'remove_tag':
+            return ok(deps.store.removeTag(verified.contactId, verified.tag));
+        case 'change_stage':
+            return ok(deps.store.changeStage(verified.contactId, verified.newStage));
+        case 'delete_contact':
+            deps.store.deleteContact(verified.contactId);
+            return ok({ deleted: true, contactId: verified.contactId });
+    }
 }
 
 /**
@@ -227,28 +348,28 @@ export function handleProposeWrite(deps: ToolDeps, args: { mutation: Mutation })
  *
  * A verified warrant is still not a guarantee of success. The store enforces
  * its own floor (frozen do-not-contact records), and it enforces it after the
- * guard has already said yes. That refusal surfaces here like any other.
+ * guard has already said yes. That refusal surfaces here like any other, and is
+ * logged like any other — with the rule that produced it named.
+ *
+ * The success event is appended after the store call returns, so nothing is
+ * recorded as done that was not done.
  */
 export function handleExecuteWrite(
     deps: ToolDeps,
     args: { tokenId: string; mutation: Mutation }
 ): CallToolResult {
-    return attempt(() => {
+    return attempt(deps, 'execute_write', args.tokenId, () => {
         const verified = deps.guard.executeWrite(args.tokenId, args.mutation);
+        const result = applyVerified(deps, verified);
 
-        switch (verified.op) {
-            case 'add_note':
-                return ok(deps.store.addNote(verified.contactId, verified.text));
-            case 'add_tag':
-                return ok(deps.store.addTag(verified.contactId, verified.tag));
-            case 'remove_tag':
-                return ok(deps.store.removeTag(verified.contactId, verified.tag));
-            case 'change_stage':
-                return ok(deps.store.changeStage(verified.contactId, verified.newStage));
-            case 'delete_contact':
-                deps.store.deleteContact(verified.contactId);
-                return ok({ deleted: true, contactId: verified.contactId });
-        }
+        deps.audit.append({
+            kind: 'execute_success',
+            op: verified.op,
+            contactId: verified.contactId,
+            tokenFingerprint: fingerprint(args.tokenId)
+        });
+
+        return result;
     });
 }
 
@@ -270,16 +391,6 @@ export interface ConfirmationChannel {
 
 /** The field the confirmation form asks for, and the only one it accepts. */
 const CONFIRM_FIELD = 'confirm';
-
-/**
- * A refusal this module owns, rather than one it is relaying.
- *
- * Same shape as {@link refuse}, same discipline: name the rule in the text,
- * because the caller is a model deciding what to do next.
- */
-function refusal(rule: string, message: string): CallToolResult {
-    return { isError: true, content: [{ type: 'text', text: `${rule}: ${message}` }] };
-}
 
 /**
  * Whether this op must be confirmed by a human before it executes.
@@ -396,6 +507,15 @@ function confirmationRequest(deps: ToolDeps, mutation: Mutation): ElicitRequestF
  * mean different things to whoever reads the transcript later. None of them
  * fall through to the write.
  *
+ * Both halves of the exchange are logged: a `confirm_requested` event when the
+ * question goes out and a `confirm_outcome` event when an answer comes back, so
+ * the record shows that a human was in the loop and what they said. Two cases
+ * deliberately produce no `confirm_outcome`: a client with no channel is asked
+ * nothing, so its outcome is the refusal itself (`refused_no_channel`), and a
+ * channel that broke mid-question returned no answer to record — only the
+ * refusal is written, because inventing an outcome for a question nobody
+ * answered is exactly the kind of thing an audit log must not do.
+ *
  * Reversible writes (`add_note`, `add_tag`) skip all of this and go straight to
  * the warrant check. Nothing is asked, because nothing is at stake that cannot
  * be undone by hand.
@@ -409,12 +529,17 @@ export async function handleConfirmedExecuteWrite(
         return handleExecuteWrite(deps, args);
     }
 
-    const attempted = `Refused ${args.mutation.op} on contact ${args.mutation.contactId}`;
+    const { op, contactId } = args.mutation;
+    const attempted = `Refused ${op} on contact ${contactId}`;
 
     if (!supportsFormElicitation(channel.getClientCapabilities())) {
         // Fail closed. The alternative — executing because nobody could be
         // asked — is exactly the degradation this gate exists to prevent.
+        deps.audit.append({ kind: 'confirm_outcome', op, contactId, outcome: 'refused_no_channel' });
         return refusal(
+            deps,
+            'execute_write',
+            args.tokenId,
             'ConfirmationUnavailableError',
             `${attempted}: this server requires an interactive confirmation channel for destructive ` +
                 `operations, and the connected client does not advertise one (no form elicitation ` +
@@ -426,6 +551,8 @@ export async function handleConfirmedExecuteWrite(
         );
     }
 
+    deps.audit.append({ kind: 'confirm_requested', op, contactId });
+
     let outcome: ElicitResult;
     try {
         outcome = await channel.elicitInput(confirmationRequest(deps, args.mutation));
@@ -433,6 +560,9 @@ export async function handleConfirmedExecuteWrite(
         // A confirmation that could not be asked is not a confirmation.
         const detail = error instanceof Error ? error.message : String(error);
         return refusal(
+            deps,
+            'execute_write',
+            args.tokenId,
             'ConfirmationChannelError',
             `${attempted}: the confirmation request to the client failed: ${detail}. ` +
                 `Rule: destructive-tier writes execute only on a confirmation that was actually ` +
@@ -447,9 +577,19 @@ export async function handleConfirmedExecuteWrite(
         `changes their mind.`;
 
     if (outcome.action !== 'accept') {
+        const declined = outcome.action === 'decline';
+        deps.audit.append({
+            kind: 'confirm_outcome',
+            op,
+            contactId,
+            outcome: declined ? 'declined' : 'cancelled'
+        });
         return refusal(
+            deps,
+            'execute_write',
+            args.tokenId,
             'ConfirmationDeclinedError',
-            `${attempted}: the user ${outcome.action === 'decline' ? 'declined' : 'cancelled'} the ` +
+            `${attempted}: the user ${declined ? 'declined' : 'cancelled'} the ` +
                 `confirmation prompt. ` +
                 `Rule: destructive-tier writes proceed only on an explicit confirmation; anything ` +
                 `that is not a yes is a no, and it is not retried by asking again. ${unspent}`
@@ -457,18 +597,24 @@ export async function handleConfirmedExecuteWrite(
     }
 
     if (outcome.content?.[CONFIRM_FIELD] !== true) {
+        deps.audit.append({ kind: 'confirm_outcome', op, contactId, outcome: 'declined' });
         return refusal(
+            deps,
+            'execute_write',
+            args.tokenId,
             'ConfirmationDeclinedError',
             `${attempted}: the user was asked to confirm this write and answered no. ` +
                 `Rule: destructive-tier writes proceed only on an explicit confirmation. ${unspent}`
         );
     }
 
+    deps.audit.append({ kind: 'confirm_outcome', op, contactId, outcome: 'confirmed' });
     return handleExecuteWrite(deps, args);
 }
 
 /**
- * Build the MCP server: four tools, two of which are halves of one write.
+ * Build the MCP server: four tools, two of which are halves of one write — and
+ * a fifth that is not registered unless it is asked for.
  *
  * Every handler is a thin lambda over the exported functions above, so the
  * behaviour under test is the behaviour that ships — the tests drive the same
@@ -479,8 +625,15 @@ export async function handleConfirmedExecuteWrite(
  * optional wrapper a caller could forget. The server hands itself in as the
  * confirmation channel, so the capability check reads whatever the *currently
  * connected* client declared — not a snapshot taken at build time.
+ *
+ * `read_audit` is registered only when `options.exposeAudit` is true, and the
+ * distinction between "not registered" and "registered but refusing" is the
+ * whole point. A tool that exists and says no still tells the model the log is
+ * there, still invites a retry, still shows up in a tool list that a prompt
+ * injection can read. A tool that was never registered is not part of the
+ * conversation at all.
  */
-export function buildServer(deps: ToolDeps): McpServer {
+export function buildServer(deps: ToolDeps, options: ServerOptions = {}): McpServer {
     const server = new McpServer({ name: 'mcp-capability-guard', version: '0.1.0' });
 
     server.registerTool(
@@ -526,7 +679,10 @@ export function buildServer(deps: ToolDeps): McpServer {
                 'mutation BURNS it permanently, so it cannot even perform its own correct mutation afterwards — ' +
                 'do not reuse or repurpose a tokenId). The returned tier tells you what you are about to do: ' +
                 '"reversible" (add_note, add_tag) can be undone by hand; "destructive" (remove_tag, ' +
-                'change_stage, delete_contact) discards information that cannot be recovered from the record.',
+                'change_stage, delete_contact) discards information that cannot be recovered from the record. ' +
+                'This reply is the only place the full tokenId is ever written down: refusals and the audit ' +
+                'trail name tokens by a truncated fingerprint, so keep the tokenId from this reply if you ' +
+                'intend to execute — you cannot recover it from anywhere else.',
             inputSchema: proposeWriteShape,
             annotations: { readOnlyHint: true, destructiveHint: false }
         },
@@ -545,7 +701,9 @@ export function buildServer(deps: ToolDeps): McpServer {
                 'ExpiredTokenError (the TTL ran out; propose again), ReplayedTokenError (that token was ' +
                 'already spent, by a successful write or by being burned), and MutationMismatchError (the ' +
                 'mutation is not the one the token authorizes — this also burns the token; propose a fresh ' +
-                'one for the write you actually want). A verified token is still not a promise of success: ' +
+                'one for the write you actually want). Refusal messages name the token by a truncated ' +
+                'fingerprint rather than in full; that is deliberate, and it is not a sign you sent the ' +
+                'wrong id. A verified token is still not a promise of success: ' +
                 'the store refuses all writes to contacts in the Closed-Lost-DNC stage with ' +
                 'NeverWriteStateError, no matter what token you hold. Returns the updated contact, or a ' +
                 'deletion acknowledgment for delete_contact. ' +
@@ -562,6 +720,26 @@ export function buildServer(deps: ToolDeps): McpServer {
         },
         (args) => handleConfirmedExecuteWrite(deps, server.server, args)
     );
+
+    if (options.exposeAudit === true) {
+        server.registerTool(
+            'read_audit',
+            {
+                title: 'Read the audit trail',
+                description:
+                    'Read the append-only audit log for this session: every read, every proposed write, ' +
+                    'every confirmation asked and answered, every write performed, and every refusal with ' +
+                    'the name of the rule that produced it. Takes no arguments and changes nothing, so it ' +
+                    'needs no capability token — but reading the log is itself recorded in it. Tokens appear ' +
+                    'only as truncated fingerprints: the log correlates events about the same warrant and ' +
+                    'cannot be used to recover or replay one. The log cannot be edited or cleared through ' +
+                    'this or any other tool.',
+                inputSchema: {},
+                annotations: { readOnlyHint: true }
+            },
+            () => handleReadAudit(deps)
+        );
+    }
 
     return server;
 }

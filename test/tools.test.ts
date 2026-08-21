@@ -9,18 +9,22 @@ import type {
     ElicitResult
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { AuditLog, fingerprint } from '../src/audit.js';
+import type { AuditEvent } from '../src/audit.js';
 import { Guard } from '../src/guard.js';
 import type { Mutation } from '../src/guard.js';
 import { InMemoryContactStore } from '../src/store.js';
 import type { Contact } from '../src/store.js';
 import {
     buildServer,
+    handleConfirmedExecuteWrite,
     handleExecuteWrite,
     handleGetContact,
     handleListContacts,
-    handleProposeWrite
+    handleProposeWrite,
+    handleReadAudit
 } from '../src/tools.js';
-import type { ToolDeps } from '../src/tools.js';
+import type { ConfirmationChannel, ToolDeps } from '../src/tools.js';
 
 const TTL = 60_000;
 const START = 1_700_000_000_000;
@@ -42,11 +46,47 @@ function sequentialIds(prefix = 'tok') {
     return () => `${prefix}-${++n}`;
 }
 
-function makeDeps() {
+function makeDeps(options: { generateId?: () => string } = {}) {
     const clock = fakeClock();
     const store = new InMemoryContactStore();
-    const guard = new Guard({ ttlMs: TTL }, { now: clock.now, generateId: sequentialIds() });
-    return { deps: { store, guard } satisfies ToolDeps, store, guard, clock };
+    const audit = new AuditLog({ now: clock.now });
+    const guard = new Guard(
+        { ttlMs: TTL },
+        { now: clock.now, generateId: options.generateId ?? sequentialIds() }
+    );
+    return { deps: { store, guard, audit } satisfies ToolDeps, store, guard, audit, clock };
+}
+
+/** Every event of one kind, narrowed so a test can read its own fields. */
+function eventsOfKind<K extends AuditEvent['kind']>(
+    events: readonly AuditEvent[],
+    kind: K
+): Extract<AuditEvent, { kind: K }>[] {
+    return events.filter((event): event is Extract<AuditEvent, { kind: K }> => event.kind === kind);
+}
+
+/** A confirmation channel that is there and always says yes. */
+function acceptingChannel(): ConfirmationChannel {
+    return {
+        getClientCapabilities: () => ({ elicitation: { form: {} } }),
+        elicitInput: () => Promise.resolve({ action: 'accept', content: { confirm: true } })
+    };
+}
+
+/** A confirmation channel that is there and always says no. */
+function decliningChannel(): ConfirmationChannel {
+    return {
+        getClientCapabilities: () => ({ elicitation: { form: {} } }),
+        elicitInput: () => Promise.resolve({ action: 'decline' })
+    };
+}
+
+/** A client that never advertised a way to be asked anything. */
+function absentChannel(): ConfirmationChannel {
+    return {
+        getClientCapabilities: () => ({}),
+        elicitInput: () => Promise.reject(new Error('this client cannot be asked'))
+    };
 }
 
 /** The text of a tool result — the only channel a refusal travels on. */
@@ -220,7 +260,11 @@ describe('tools', () => {
 
             expect(result.isError).toBe(true);
             expect(textOf(result)).toContain('UnknownTokenError');
-            expect(textOf(result)).toContain('tok-i-made-this-up');
+            // The refusal names the token by fingerprint, never in full: the
+            // guard writes the whole id into its message and this layer cuts it
+            // down before the text goes anywhere. See the redaction tests below.
+            expect(textOf(result)).toContain(fingerprint('tok-i-made-this-up'));
+            expect(textOf(result)).not.toContain('tok-i-made-this-up');
             expect(store.getContact('c-001').notes).toHaveLength(1);
         });
 
@@ -621,6 +665,359 @@ describe('tools', () => {
             } finally {
                 await wire.close();
             }
+        });
+    });
+
+    /**
+     * The audit trail. Two rules are under test here, and only one of them is
+     * about bookkeeping.
+     *
+     * The first is that the log is a faithful account: the events, in order,
+     * say what was asked for, what a human answered, what was written, and what
+     * was refused by name.
+     *
+     * The second is the redaction rule, and it is the reason the module exists.
+     * A capability token is a bearer credential — whoever can read one can spend
+     * it — so an audit trail that quotes tokens in full is a place live warrants
+     * accumulate. The decoy tests below take that literally: they mint every
+     * token in the run with one recognizable id, run the flows including the
+     * refusals whose messages are *written by the guard with the id in them*,
+     * and then search the entire log and every tool result for that string.
+     */
+    describe('audit trail', () => {
+        const CONFIRMED_FLOW = EVERY_OP[3]!; // change_stage c-004 -> Closed-Won
+
+        /** A client connected to a freshly built server, for tool-list checks. */
+        async function connectTo(server: ReturnType<typeof buildServer>) {
+            const client = new Client({ name: 'audit-surface-test-client', version: '0.0.0' }, { capabilities: {} });
+            const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+            await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+            return {
+                async toolNames(): Promise<string[]> {
+                    return (await client.listTools()).tools.map((tool) => tool.name);
+                },
+                async call(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
+                    return (await client.callTool({ name, arguments: args })) as CallToolResult;
+                },
+                async close() {
+                    await client.close();
+                    await server.close();
+                }
+            };
+        }
+
+        it('records a read, a proposal, both halves of the confirmation, and the write', async () => {
+            const { deps, audit } = makeDeps();
+
+            handleListContacts(deps);
+            const { tokenId } = proposalOf(handleProposeWrite(deps, { mutation: CONFIRMED_FLOW }));
+            const result = await handleConfirmedExecuteWrite(deps, acceptingChannel(), {
+                tokenId,
+                mutation: CONFIRMED_FLOW
+            });
+
+            expect(result.isError).toBeFalsy();
+
+            const events = audit.list();
+            expect(events.map((event) => event.kind)).toEqual([
+                'read',
+                'propose',
+                'confirm_requested',
+                'confirm_outcome',
+                'execute_success'
+            ]);
+
+            expect(eventsOfKind(events, 'read')[0]).toMatchObject({
+                tool: 'list_contacts',
+                summary: 'listed 7 contacts'
+            });
+            expect(eventsOfKind(events, 'propose')[0]).toMatchObject({
+                op: 'change_stage',
+                contactId: 'c-004',
+                tier: 'destructive',
+                tokenFingerprint: fingerprint(tokenId)
+            });
+            expect(eventsOfKind(events, 'confirm_requested')[0]).toMatchObject({
+                op: 'change_stage',
+                contactId: 'c-004'
+            });
+            expect(eventsOfKind(events, 'confirm_outcome')[0]).toMatchObject({ outcome: 'confirmed' });
+            expect(eventsOfKind(events, 'execute_success')[0]).toMatchObject({
+                op: 'change_stage',
+                contactId: 'c-004',
+                tokenFingerprint: fingerprint(tokenId)
+            });
+
+            // Every event is stamped from the injected clock, not the wall.
+            const at = new Date(START).toISOString();
+            expect(events.every((event) => event.at === at)).toBe(true);
+        });
+
+        it('asks nobody for a reversible write, and says so by omission', () => {
+            const { deps, audit } = makeDeps();
+            const mutation = EVERY_OP[0]!; // add_note
+
+            const { tokenId } = proposalOf(handleProposeWrite(deps, { mutation }));
+            expect(handleExecuteWrite(deps, { tokenId, mutation }).isError).toBeFalsy();
+
+            expect(audit.list().map((event) => event.kind)).toEqual(['propose', 'execute_success']);
+        });
+
+        it('logs a refusal naming ReplayedTokenError when a spent token is presented again', () => {
+            // A realistically long id, so the redaction below is doing real work:
+            // a fingerprint of an id shorter than the prefix shows it whole, which
+            // is a property of short ids rather than of the redaction.
+            const { deps, audit } = makeDeps({ generateId: () => 'tok-replay-long-enough-to-redact' });
+            const mutation = EVERY_OP[1]!; // add_tag, reversible: no confirmation in the way
+
+            const { tokenId } = proposalOf(handleProposeWrite(deps, { mutation }));
+            expect(handleExecuteWrite(deps, { tokenId, mutation }).isError).toBeFalsy();
+            expect(handleExecuteWrite(deps, { tokenId, mutation }).isError).toBe(true);
+
+            const events = audit.list();
+            expect(events.map((event) => event.kind)).toEqual(['propose', 'execute_success', 'refusal']);
+
+            const refusal = eventsOfKind(events, 'refusal')[0]!;
+            expect(refusal.tool).toBe('execute_write');
+            expect(refusal.rule).toBe('ReplayedTokenError');
+            expect(refusal.message).toContain('single-use');
+            expect(refusal.message).toContain(fingerprint(tokenId));
+            expect(refusal.message).not.toContain(tokenId);
+        });
+
+        it('logs the store floor by name when a verified warrant is refused underneath it', () => {
+            const { deps, audit } = makeDeps();
+            const mutation: Mutation = { op: 'add_note', contactId: 'c-007', text: 'Following up anyway.' };
+
+            const { tokenId } = proposalOf(handleProposeWrite(deps, { mutation }));
+            expect(handleExecuteWrite(deps, { tokenId, mutation }).isError).toBe(true);
+
+            const events = audit.list();
+            // No execute_success: the write that never happened is not recorded
+            // as one, and the refusal names the layer that refused.
+            expect(events.map((event) => event.kind)).toEqual(['propose', 'refusal']);
+            expect(eventsOfKind(events, 'refusal')[0]).toMatchObject({
+                tool: 'execute_write',
+                rule: 'NeverWriteStateError'
+            });
+        });
+
+        it('records refused_no_channel as the outcome when there is nobody to ask', async () => {
+            const { deps, audit } = makeDeps();
+            const mutation = EVERY_OP[4]!; // delete_contact c-006
+
+            const { tokenId } = proposalOf(handleProposeWrite(deps, { mutation }));
+            const refused = await handleConfirmedExecuteWrite(deps, absentChannel(), { tokenId, mutation });
+
+            expect(refused.isError).toBe(true);
+
+            const events = audit.list();
+            // No confirm_requested: nothing was asked, so nothing is recorded as
+            // asked. The outcome names why.
+            expect(events.map((event) => event.kind)).toEqual(['propose', 'confirm_outcome', 'refusal']);
+            expect(eventsOfKind(events, 'confirm_outcome')[0]).toMatchObject({
+                op: 'delete_contact',
+                contactId: 'c-006',
+                outcome: 'refused_no_channel'
+            });
+            expect(eventsOfKind(events, 'refusal')[0]).toMatchObject({ rule: 'ConfirmationUnavailableError' });
+        });
+
+        it('records a declined confirmation as declined, with no write after it', async () => {
+            const { deps, audit } = makeDeps();
+            const mutation = EVERY_OP[4]!; // delete_contact c-006
+
+            const { tokenId } = proposalOf(handleProposeWrite(deps, { mutation }));
+            expect(
+                (await handleConfirmedExecuteWrite(deps, decliningChannel(), { tokenId, mutation })).isError
+            ).toBe(true);
+
+            const events = audit.list();
+            expect(events.map((event) => event.kind)).toEqual([
+                'propose',
+                'confirm_requested',
+                'confirm_outcome',
+                'refusal'
+            ]);
+            expect(eventsOfKind(events, 'confirm_outcome')[0]).toMatchObject({ outcome: 'declined' });
+            expect(eventsOfKind(events, 'refusal')[0]).toMatchObject({ rule: 'ConfirmationDeclinedError' });
+        });
+
+        /**
+         * The decoy. Every token in this run is minted with the same
+         * unmistakable id, and the flows deliberately include the refusals whose
+         * messages the guard writes *with that id embedded in the text* —
+         * ReplayedTokenError, MutationMismatchError — plus the two this module
+         * writes itself. If any of them reaches the log unredacted, the search
+         * below finds it.
+         */
+        describe('the decoy token never reaches the record', () => {
+            const DECOY = 'tok-decoy-9f3c2b-full-value-never-logged';
+
+            /** Run every interesting path, keeping the results apart by kind. */
+            async function runFlows() {
+                const harness = makeDeps({ generateId: () => DECOY });
+                const { deps } = harness;
+                const proposals: CallToolResult[] = [];
+                const others: CallToolResult[] = [];
+
+                others.push(handleListContacts(deps));
+
+                // Reversible: propose, execute, then replay the spent warrant.
+                const note = EVERY_OP[0]!;
+                proposals.push(handleProposeWrite(deps, { mutation: note }));
+                const noteToken = proposalOf(proposals[0]!).tokenId;
+                others.push(handleExecuteWrite(deps, { tokenId: noteToken, mutation: note }));
+                others.push(handleExecuteWrite(deps, { tokenId: noteToken, mutation: note }));
+
+                // Mismatch: a fresh warrant presented with a substituted payload.
+                const tag = EVERY_OP[1]!;
+                proposals.push(handleProposeWrite(deps, { mutation: tag }));
+                others.push(
+                    handleExecuteWrite(deps, {
+                        tokenId: proposalOf(proposals[1]!).tokenId,
+                        mutation: { op: 'add_tag', contactId: 'c-001', tag: 'do-not-contact' }
+                    })
+                );
+
+                // Destructive: refused for want of a channel, then declined,
+                // then confirmed — all on one warrant, since neither refusal
+                // spends it.
+                const remove = EVERY_OP[4]!;
+                proposals.push(handleProposeWrite(deps, { mutation: remove }));
+                const removeToken = proposalOf(proposals[2]!).tokenId;
+                others.push(
+                    await handleConfirmedExecuteWrite(deps, absentChannel(), {
+                        tokenId: removeToken,
+                        mutation: remove
+                    })
+                );
+                others.push(
+                    await handleConfirmedExecuteWrite(deps, decliningChannel(), {
+                        tokenId: removeToken,
+                        mutation: remove
+                    })
+                );
+                others.push(
+                    await handleConfirmedExecuteWrite(deps, acceptingChannel(), {
+                        tokenId: removeToken,
+                        mutation: remove
+                    })
+                );
+
+                // And the log read back through its own tool.
+                others.push(handleReadAudit(deps));
+
+                return { ...harness, proposals, others };
+            }
+
+            it('keeps the whole id out of every audit event, fingerprint and all', async () => {
+                const { audit, others } = await runFlows();
+
+                const events = audit.list();
+                const serialized = JSON.stringify(events);
+
+                expect(serialized).not.toContain(DECOY);
+                expect(serialized).toContain(fingerprint(DECOY));
+
+                // The run really did exercise the paths that quote the token.
+                expect(others.some((result) => result.isError === true)).toBe(true);
+                expect(eventsOfKind(events, 'refusal').map((event) => event.rule)).toEqual([
+                    'ReplayedTokenError',
+                    'MutationMismatchError',
+                    'ConfirmationUnavailableError',
+                    'ConfirmationDeclinedError'
+                ]);
+                expect(eventsOfKind(events, 'execute_success').map((event) => event.tokenFingerprint)).toEqual([
+                    fingerprint(DECOY),
+                    fingerprint(DECOY)
+                ]);
+            });
+
+            it('keeps the whole id out of every tool result except the proposal that mints it', async () => {
+                const { proposals, others } = await runFlows();
+
+                for (const result of others) {
+                    expect(textOf(result)).not.toContain(DECOY);
+                }
+
+                // Refusals still identify the token — by fingerprint, which is
+                // enough to correlate and not enough to spend.
+                const refusals = others.filter((result) => result.isError === true);
+                expect(refusals).toHaveLength(4);
+                for (const refused of refusals) {
+                    expect(textOf(refused)).toContain(fingerprint(DECOY));
+                }
+
+                // The one legitimate exception: propose_write hands the caller
+                // the id it will have to present. Nowhere else in the payload.
+                expect(proposals).toHaveLength(3);
+                for (const proposal of proposals) {
+                    const parsed = payloadOf(proposal) as Record<string, unknown>;
+                    expect(parsed['tokenId']).toBe(DECOY);
+
+                    const { tokenId: _minted, ...withoutTheToken } = parsed;
+                    expect(JSON.stringify(withoutTheToken)).not.toContain(DECOY);
+                }
+            });
+        });
+
+        describe('read_audit is denied by default', () => {
+            it('is not registered at all unless it is asked for', async () => {
+                const { deps, audit } = makeDeps();
+                const wire = await connectTo(buildServer(deps));
+                try {
+                    const names = await wire.toolNames();
+
+                    expect(names).toEqual(['list_contacts', 'get_contact', 'propose_write', 'execute_write']);
+                    expect(names).not.toContain('read_audit');
+
+                    // Absent, not present-and-refusing: the refusal comes from
+                    // the protocol layer, which has no such tool to dispatch to.
+                    // No handler of ours ran, and nothing was logged.
+                    const attempted = await wire.call('read_audit', {});
+                    expect(attempted.isError).toBe(true);
+                    expect(textOf(attempted)).toContain('Tool read_audit not found');
+                    expect(audit.list()).toEqual([]);
+                } finally {
+                    await wire.close();
+                }
+            });
+
+            it('is registered and returns the trail when exposeAudit is true', async () => {
+                const { deps, audit } = makeDeps();
+                const mutation = EVERY_OP[0]!;
+
+                handleListContacts(deps);
+                const { tokenId } = proposalOf(handleProposeWrite(deps, { mutation }));
+                expect(handleExecuteWrite(deps, { tokenId, mutation }).isError).toBeFalsy();
+
+                const wire = await connectTo(buildServer(deps, { exposeAudit: true }));
+                try {
+                    expect(await wire.toolNames()).toContain('read_audit');
+
+                    const payload = payloadOf(await wire.call('read_audit', {})) as {
+                        count: number;
+                        events: AuditEvent[];
+                    };
+
+                    expect(payload.count).toBe(3);
+                    expect(payload.events.map((event) => event.kind)).toEqual([
+                        'read',
+                        'propose',
+                        'execute_success'
+                    ]);
+                    expect(JSON.stringify(payload)).toContain(fingerprint(tokenId));
+
+                    // Reading the log is itself an event, appended after the
+                    // snapshot the caller was handed.
+                    expect(audit.list()).toHaveLength(4);
+                    expect(audit.list().at(-1)).toMatchObject({ kind: 'read', tool: 'read_audit' });
+                } finally {
+                    await wire.close();
+                }
+            });
         });
     });
 });

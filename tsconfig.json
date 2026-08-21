@@ -26,6 +26,8 @@
     "noImplicitOverride": true,
     "noPropertyAccessFromIndexSignature": true,
 
+    "types": ["node"],
+
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,

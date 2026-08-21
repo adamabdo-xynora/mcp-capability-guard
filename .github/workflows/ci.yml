@@ -1,0 +1,24 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      # The demo is also a smoke test: it wires the real server to a scripted
+      # client and exits nonzero if any step's expectation fails. Running it in
+      # CI means every push proves the whole propose->confirm->execute->audit
+      # path end to end. No API key exists anywhere in this pipeline: the
+      # entire suite, demo included, is offline by construction.
+      - run: npm run demo

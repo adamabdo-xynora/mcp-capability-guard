@@ -1,0 +1,36 @@
+# What never enters the build context.
+#
+# The Dockerfile only ever COPYs from the context, so a file excluded here
+# cannot end up in a layer — not by a careless `COPY . .`, not by a future
+# edit to the Dockerfile, not by anyone. That is the whole reason .env is
+# listed: a secret that cannot enter the build context cannot end up in an
+# image. Anything the server needs at run time arrives through `docker run -e`
+# or a mounted file, never through the context.
+
+# Secrets and local configuration
+.env
+.env.*
+
+# Dependencies — the image installs its own from the lockfile, so a host
+# node_modules (wrong platform, wrong node, possibly stale) must not leak in.
+node_modules
+
+# Version control
+.git
+.gitignore
+.github
+
+# Build output and test residue — the image builds its own dist/ from source.
+dist
+coverage
+*.log
+*.tsbuildinfo
+
+# Editor and OS noise
+.DS_Store
+.vscode
+.idea
+
+# Docker's own files
+Dockerfile
+.dockerignore

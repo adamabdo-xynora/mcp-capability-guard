@@ -24,6 +24,17 @@ The demo wires the real server to a scripted client over an in-memory MCP transp
 
 Everything is offline: no API keys, no network, no environment variables, nothing to configure. That is why CI runs the entire suite, demo included, on every push with no secrets.
 
+The same holds inside a container. The `Dockerfile` is multi-stage: a `test` stage carries the devDependencies and the full tree, and the default target is a lean runtime with `--omit=dev` — no vitest, no tsx, no TypeScript, no tests — that runs the server itself over stdio from `bin/serve.ts`, compiled.
+
+    docker build --target test -t mcp-capability-guard:test .
+    docker run --rm mcp-capability-guard:test npm test          # the same 158 tests, offline
+    docker run --rm mcp-capability-guard:test npm run demo      # and the same demo
+
+    docker build -t mcp-capability-guard .
+    docker run -i --rm mcp-capability-guard                     # the MCP server, stdio
+
+The `-i` is not optional: a stdio server reads its client from stdin, and `docker run` closes stdin by default, so without it the server sees EOF and exits at once. An MCP client runs that `docker run -i --rm` line as the server command; the comment above `CMD` in the `Dockerfile` shows the client config and states the caveats. Nothing in the build takes a secret, and `.dockerignore` keeps `.env` out of the context so one cannot enter a layer by accident.
+
 ## The evidence is in the test suites
 
 Two suites exist specifically to keep the claims above honest:

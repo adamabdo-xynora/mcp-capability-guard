@@ -35,6 +35,19 @@ The same holds inside a container. The `Dockerfile` is multi-stage: a `test` sta
 
 The `-i` is not optional: a stdio server reads its client from stdin, and `docker run` closes stdin by default, so without it the server sees EOF and exits at once. An MCP client runs that `docker run -i --rm` line as the server command; the comment above `CMD` in the `Dockerfile` shows the client config and states the caveats. Nothing in the build takes a secret, and `.dockerignore` keeps `.env` out of the context so one cannot enter a layer by accident.
 
+### Container image
+
+The runtime image is published to GHCR on every version tag, by a workflow whose gate runs the 158
+tests, the typecheck and the demo inside the test image first — the push step is unreachable unless
+all three pass.
+
+    docker pull ghcr.io/adamabdo-xynora/mcp-capability-guard:0.1.0
+    docker run -i --rm ghcr.io/adamabdo-xynora/mcp-capability-guard:0.1.0
+
+It runs the compiled MCP server over stdio, the same `dist/bin/serve.js` the local build produces.
+With stdin closed it writes `listening on stdio` to stderr, nothing at all to stdout, and exits 0.
+The `-i` matters here for the reason given above. Published for `linux/amd64` and `linux/arm64`.
+
 ## The evidence is in the test suites
 
 Two suites exist specifically to keep the claims above honest:

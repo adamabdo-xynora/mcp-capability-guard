@@ -1,0 +1,67 @@
+name: publish-image
+# Tag-triggered publish. The gate below is the reason this file is not just a
+# build-push: this repo's `test` stage ends at CMD, not RUN, so
+# `docker build --target test .` exits 0 having executed nothing but `npm ci`.
+# Tests only run on `docker run`. Each run is its own step, so a nonzero exit
+# fails the job directly — no pipes, no `|| true`, nothing to swallow it.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+  packages: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      # --load is required: under buildx the built image otherwise stays in the
+      # builder cache and is not visible to `docker run`. No `platforms` here
+      # on purpose — the gate builds natively and runs the suite once, rather
+      # than three times under QEMU. Whether this commit is fit to publish is
+      # an arch-independent question about the source.
+      - name: Build the test stage
+        run: docker build --target test --load -t ci-test .
+
+      - name: Run the test suite inside the image
+        run: docker run --rm ci-test npm test
+
+      - name: Typecheck inside the image
+        run: docker run --rm ci-test npm run typecheck
+
+      # The demo wires the real server to a scripted client in memory and
+      # asserts each step, so it exercises the guard end to end. Offline.
+      - name: Run the offline demo inside the image
+        run: docker run --rm ci-test npm run demo
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/adamabdo-xynora/${{ github.event.repository.name }}
+          # A release tag is immutable; `latest` would drift off it. Only the
+          # version and the commit are published.
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+          labels: |
+            org.opencontainers.image.description=An MCP server where every write needs a warrant: single-use capability tokens bound to one exact mutation, burn-on-mismatch, human confirmation for destructive writes, a store-level floor no consent overrides, and an audit log that fingerprints every token
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          # Published for both arches so the documented `docker pull` works on
+          # arm64 laptops without a --platform flag.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

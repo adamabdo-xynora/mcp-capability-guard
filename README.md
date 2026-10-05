@@ -41,12 +41,20 @@ The runtime image is published to GHCR on every version tag, by a workflow whose
 tests, the typecheck and the demo inside the test image first — the push step is unreachable unless
 all three pass.
 
-    docker pull ghcr.io/adamabdo-xynora/mcp-capability-guard:0.1.0
-    docker run -i --rm ghcr.io/adamabdo-xynora/mcp-capability-guard:0.1.0
+    docker pull ghcr.io/adamabdo-xynora/mcp-capability-guard:0.1.1
+    docker run -i --rm ghcr.io/adamabdo-xynora/mcp-capability-guard:0.1.1
 
 It runs the compiled MCP server over stdio, the same `dist/bin/serve.js` the local build produces.
 With stdin closed it writes `listening on stdio` to stderr, nothing at all to stdout, and exits 0.
 The `-i` matters here for the reason given above. Published for `linux/amd64` and `linux/arm64`.
+
+The image carries signed build provenance, so you can check that these bytes came from this
+repository's CI rather than from someone with push access to the registry:
+
+    gh attestation verify oci://ghcr.io/adamabdo-xynora/mcp-capability-guard:0.1.1 --owner adamabdo-xynora
+
+`0.1.0` remains published, `linux/amd64` only and without an attestation. Its digest has not
+changed and will not: a version that alters its bytes is not a version.
 
 ## The evidence is in the test suites
 
